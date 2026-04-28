@@ -1,0 +1,537 @@
+---
+title: "Preliminary result"
+format: html
+editor: visual
+---
+
+## Load data
+
+```{r, echo=TRUE, output=FALSE}
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(scales)
+library(gtsummary)
+library(dplyr)
+library(ggplot2)
+
+# Note: The raw EHC dataset is confidential. Please ensure the dataset is in your working directory.
+datapath <- "Racial Disparity Phase 2 - 03.04.2026.csv"
+
+df <- read_csv(datapath, show_col_types = FALSE) %>%
+  clean_names()
+
+df <- df %>%
+  mutate(
+    exclude = str_squish(as.character(exclude)),
+    exclude = na_if(exclude, "")   # treat blanks as NA
+  )
+
+# Apply manual exclusions (Exclude == "x")
+df <- df %>%
+  filter(is.na(exclude) | tolower(exclude) != "x")
+```
+
+### Create person-level dataset with Case vs Control
+
+Because each row is a case–control pair, we now split into two datasets.
+
+Now it's one row per person with variables `age`, `race`, `gender`, and a factor `case_fac` indicating whether the row is a case or a control.
+
+```{r}
+df_case <- df %>%
+  transmute(
+    pair_id,
+    row_id,
+    case_fac = "Case",
+    dx_cd,
+    dx_desc,
+    race   = race_desc,
+    gender = gender_desc,
+    age    = age_at_visit,
+    
+    # --- provider-related fields (CASE) ---
+    dx_provider_nm,
+    dx_provider_dept,
+    prov_name_closest_visit,
+    prov_spec_closest_visit,
+    mons_btw_dx_pcp,
+    emory_assoc_pcp,
+    closest_visit_prov_pcp_flag
+  )
+
+df_control <- df %>%
+  transmute(
+    pair_id,
+    row_id = row_id_cont,
+    case_fac = "Control",
+    dx_cd = NA_character_,
+    dx_desc = NA_character_,
+    race   = cont_race_desc,
+    gender = cont_gender_desc,
+    age    = cont_age_at_visit,
+    
+    # --- provider-related fields (CONTROL) ---
+    cont_provider_nm,
+    cont_provider_spec,
+
+    # case-derived fields
+    dx_provider_nm,
+    dx_provider_dept,
+    prov_name_closest_visit,
+    prov_spec_closest_visit,
+    mons_btw_dx_pcp,
+    emory_assoc_pcp,
+    closest_visit_prov_pcp_flag
+  )
+
+df_long <- bind_rows(df_case, df_control) %>%
+  mutate(
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    case_indicator = if_else(case_fac == "Case", 1L, 0L)
+  )
+```
+
+### 
+
+## Race recoding and validation
+
+Several race categories have very small sample sizes (e.g., American Indian or Alaska Native, Chinese, Other). So we collapse them into 5 broader groups:
+
+-   White/Caucasian or White
+
+-   Black or African American
+
+-   Asian
+
+-   Other/Small Group
+
+-   Unknown/Not Reported - Decline to Answer, Unknown, Not Recorded
+
+```{r}
+df_long <- df_long %>%
+  mutate(
+    race = str_squish(as.character(race)),
+    race_grouped = case_when(
+      # Asian categories
+      race %in% c("Chinese", "Other Asian", "Asian Indian", "Korean", "Vietnamese",
+                  "Other Pacific Islander", "Native Hawaiian") ~ "Asian",
+
+      # Small minority categories
+      race %in% c("American Indian or Alaska Native",
+                  "American Indian or Alaskan Native",
+                  "Multiple",
+                  "Other") ~ "Other/Small Group",
+
+      # Missing / unclear
+      race %in% c("Decline to Answer", "Unknown", "Not Recorded") ~ "Unknown/Not Reported",
+      is.na(race) | race == "" ~ "Unknown/Not Reported",
+
+      # White
+      race %in% c("White", "Caucasian or White") ~ "White",
+      
+      # Black
+      TRUE ~ race
+    ),
+    race_grouped = factor(
+      race_grouped,
+      levels = c("White", "Black or African American",
+                 "Asian", "Other/Small Group", "Unknown/Not Reported")
+    )
+  )
+```
+
+1.  Show sample size for each grouped race category
+
+```{r}
+df_long %>%
+  count(race_grouped) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  arrange(desc(n))
+```
+
+2.  Show case vs control counts within each race group
+
+```{r}
+df_long %>% count(race_grouped, case_fac) %>% arrange(race_grouped)
+```
+
+## Disease-group mapping
+
+```{r}
+df_long <- df_long %>%
+  mutate(
+    dx_desc_clean = if_else(is.na(dx_desc), NA_character_, str_squish(as.character(dx_desc))),
+
+    # clean DX_CD
+    dx_cd_raw = if_else(is.na(dx_cd), NA_character_, str_to_upper(str_squish(as.character(dx_cd)))),
+    dx_cd_raw = if_else(is.na(dx_cd_raw), NA_character_, str_replace_all(dx_cd_raw, "\\s+", "")),
+    dx_cd_raw = if_else(is.na(dx_cd_raw), NA_character_, str_replace_all(dx_cd_raw, "[^A-Z0-9\\.]", "")),
+
+    # If starts with 'G' (ICD-10 style), keep dot + trailing 0 (e.g., G30.0)
+    # Otherwise (mostly numeric ICD-9 style), trim trailing zeros after decimal (e.g., 335.20 -> 335.2)
+    dx_cd_std = case_when(
+      is.na(dx_cd_raw) ~ NA_character_,
+      str_starts(dx_cd_raw, "G") ~ dx_cd_raw,
+      TRUE ~ str_replace(dx_cd_raw, "(\\.[0-9]*?)0+$", "\\1") |> str_replace("\\.$", "")
+    ),
+
+    disease_group = case_when(
+      case_fac != "Case" ~ NA_character_,
+
+      # --- AD ---
+      dx_cd_std == "G30.0" ~ "EOAD",
+      dx_cd_std == "G30.1" ~ "LOAD",
+      dx_cd_std %in% c("G30.9", "331", "G30.8") & age >= 65 ~ "LOAD",
+      dx_cd_std %in% c("G30.9", "331", "G30.8") & age <  65 ~ "EOAD",
+
+      # --- PD ---
+      dx_cd_std %in% c("G20", "332") ~ "PD",
+
+      # --- DLB ---
+      dx_cd_std %in% c("G31.83", "331.82") ~ "DLB",
+
+      # --- MND ---
+      dx_cd_std %in% c("335.2", "G12.21", "G12.22", "G12.20", "G12.29", "335.24") ~ "MND",
+
+      # --- FTD ---
+      dx_cd_std %in% c("G31.09", "331.19", "G31.01") ~ "FTD",
+
+      TRUE ~ NA_character_
+    ),
+
+    disease_group = factor(disease_group, levels = c("LOAD", "EOAD", "FTD", "DLB", "PD", "MND"))
+  )
+```
+
+Diagnoses were grouped into six disease categories based on observed diagnosis descriptions in the Emory dataset. Alzheimer’s disease was further stratified into late-onset (LOAD) and early-onset (EOAD) using age at diagnosis. Diagnoses that did not map to these categories were excluded from disease-stratified analyses.
+
+### Diagnosis count table
+
+```{r}
+df_long %>%
+  filter(case_fac == "Case") %>%
+  count(disease_group, dx_desc_clean, sort = TRUE)
+```
+
+## Table 1
+
+Table 1 summarizes baseline demographic characteristics for cases and controls at the person level.
+
+```{r}
+table1 <- df_long %>%
+  select(case_fac, age, gender, race_grouped) %>%
+  tbl_summary(
+    by = case_fac,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no",
+    label = list(
+      age ~ "Age at Visit",
+      gender ~ "Gender",
+      race_grouped ~ "Race Group"
+    )
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  modify_caption("**Table 1. Baseline Demographic Characteristics of Cases and Controls**")
+
+table1
+```
+
+## Age distribution across races for all participants
+
+```{r}
+ggplot(df_long, aes(x = race_grouped, y = age, fill = race_grouped)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_bw(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(title = "Age Distribution Across Race Group",
+       x = "Race",
+       y = "Age at Visit") +
+  scale_fill_brewer(palette = "Set2")
+```
+
+## Age density by race for all participants
+
+After collapsing very small racial categories into broader groups (Other/Small Group), the age density curves became more stable and less spiky.
+
+```{r}
+ggplot(df_long, aes(x = age, color = race_grouped, fill = race_grouped)) +
+  geom_density(alpha = 0.20, adjust = 2) +
+  theme_bw(base_size = 13) +
+  labs(title = "Age Density by Race Group",
+       x = "Age at Visit",
+       y = "Density")
+```
+
+## Gender distribution by race for all participants
+
+For each race group, the bar shows the proportion of males and females (bars sum to 100% within race).
+
+```{r}
+df_long %>%
+  count(race_grouped, gender) %>%
+  group_by(race_grouped) %>%
+  mutate(prop = n/sum(n)) %>%
+  ggplot(aes(x = race_grouped, y = prop, fill = gender)) +
+  geom_col() +
+  geom_text(aes(label = scales::percent(prop, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            size = 3) +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(title = "Gender Distribution Within Each Race Group",
+       x = "Race",
+       y = "Proportion") +
+  scale_y_continuous(labels = scales::percent)
+```
+
+```{r}
+# Gender distribution by race (counts)
+df_long %>%
+  count(race_grouped, gender) %>%
+  ggplot(aes(x = race_grouped, y = n, fill = gender)) +
+  geom_col() +
+  geom_text(
+    aes(label = n),
+    position = position_stack(vjust = 0.5),
+    size = 3) +
+  theme_bw(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+  labs(
+    title = "Gender Distribution by Race Group (Counts)",
+    x = "Race",
+    y = "Number of Participants",
+    fill = "Gender"
+  )
+```
+
+## Age distribution in Cases vs Controls
+
+```{r}
+ggplot(df_long, aes(x = case_fac, y = age, fill = case_fac)) +
+  geom_boxplot(alpha = 0.7) +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Age Distribution of Cases vs Control",
+    x = "Group",
+    y = "Age at Visit"
+  ) +
+  guides(fill = "none")
+```
+
+```{r}
+ggplot(df_long, aes(x = case_fac, y = age)) +
+  geom_boxplot(alpha = 0.7) +
+  facet_wrap(~ race_grouped) +
+  theme_bw(base_size = 12) +
+  labs(
+    title = "Age Distribution of Cases vs Controls Within Race Groups",
+    x = "Group",
+    y = "Age at Visit"
+  )
+
+```
+
+## Race distribution in Cases vs Controls
+
+```{r}
+df_long %>%
+  count(case_fac, race_grouped) %>%
+  group_by(case_fac) %>%
+  mutate(prop = n/sum(n)) %>%
+  ggplot(aes(x = case_fac, y = prop, fill = race_grouped)) +
+  geom_col() + 
+  geom_text(aes(label = scales::percent(prop, accuracy = 1)),
+            position = position_stack(vjust = 0.5),
+            size = 3) + 
+  theme_bw(base_size = 13) +
+  labs(title = "Race Distribution of Cases vs Controls",
+       x = "Group",
+       y = "Proportion") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Set2")
+```
+
+## Disease matched case/control dataset
+
+```{r}
+# Assign controls the disease group of their matched case
+case_disease <- df_long %>%
+  filter(case_fac == "Case", !is.na(disease_group)) %>%
+  distinct(pair_id, disease_group)
+
+df_disease_cc <- df_long %>%
+  left_join(case_disease, by = "pair_id", suffix = c("", "_case")) %>%
+  mutate(
+    disease_group_case = disease_group_case,
+    disease_group_case = factor(disease_group_case, levels = levels(df_long$disease_group)),
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    race_grouped = fct_drop(race_grouped)   # drop unused levels (helps plotting)
+  ) %>%
+  filter(!is.na(disease_group_case))
+```
+
+### Table: Case vs Control counts by disease group
+
+```{r}
+df_disease_cc %>%
+  count(disease_group_case, case_fac) %>%
+  group_by(disease_group_case) %>%
+  mutate(percent = round(100 * n / sum(n), 1)) %>%
+  ungroup()
+```
+
+### Race composition by disease group
+
+```{r}
+# Race composition by disease group
+plot_slope_white_black <- df_disease_cc %>%
+  filter(
+    !is.na(disease_group_case),
+    race_grouped %in% c("White", "Black or African American")
+  ) %>%
+  count(disease_group_case, case_fac, race_grouped, name = "n") %>%
+  group_by(disease_group_case, case_fac) %>%
+  mutate(pct = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    race_grouped = factor(
+      race_grouped,
+      levels = c("White", "Black or African American")
+    )
+  )
+
+ggplot(plot_slope_white_black,
+       aes(x = case_fac, y = pct, group = race_grouped, color = race_grouped)) +
+  geom_line(linewidth = 1.4) +
+  geom_point(size = 3) +
+
+  geom_text(
+    data = subset(plot_slope_white_black, case_fac == "Control"),
+    aes(label = percent(pct, accuracy = 0.1)),
+    hjust = 1.1, vjust = 0.5, size = 3.2, show.legend = FALSE
+  ) +
+  geom_text(
+    data = subset(plot_slope_white_black, case_fac == "Case"),
+    aes(label = percent(pct, accuracy = 0.1)),
+    hjust = -0.1, vjust = 0.5, size = 3.2, show.legend = FALSE
+  ) +
+
+  facet_wrap(~ disease_group_case, ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  coord_cartesian(clip = "off") +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.margin = margin(8, 60, 8, 60),
+    axis.title.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "White vs Black/African American composition by disease group",
+    y = "Percent within disease group",
+    color = "Race group"
+  )
+```
+
+```{r}
+# Table 2. Baseline demographics by disease group (cases) + Control
+df_table2 <- df_long %>%
+  mutate(
+    disease_group_cc = if_else(case_fac == "Control", "Control", as.character(disease_group))
+  ) %>%
+  filter(!is.na(disease_group_cc)) %>%
+  mutate(
+    disease_group_cc = factor(
+      disease_group_cc,
+      levels = c("Control", levels(df_long$disease_group))
+    )
+  )
+
+table2 <- df_table2 %>%
+  select(disease_group_cc, age, gender, race_grouped) %>%
+  tbl_summary(
+    by = disease_group_cc,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no",
+    label = list(
+      age ~ "Age at Visit",
+      gender ~ "Gender",
+      race_grouped ~ "Race Group"
+    )
+  ) %>%
+  add_overall() %>%
+  add_p() %>%
+  modify_caption("**Table 2. Baseline Demographic Characteristics by Disease Group (Cases) and Controls**")
+
+table2
+```
+
+EOAD Primary care provider
+
+```{r}
+df_eoad_cc <- df_disease_cc %>%
+  filter(disease_group_case == "EOAD") %>%
+  mutate(
+    case_fac = str_squish(as.character(case_fac))
+  )
+
+eoad_pcp_provider_long <- df_eoad_cc %>%
+  mutate(
+    primary_care_provider = case_when(
+      case_fac == "Case"    ~ prov_name_closest_visit,
+      case_fac == "Control" ~ cont_provider_nm,
+      TRUE ~ NA_character_
+    ),
+    primary_care_provider = str_squish(as.character(primary_care_provider))
+  ) %>%
+  filter(!is.na(primary_care_provider), primary_care_provider != "") %>%
+  count(primary_care_provider, case_fac, name = "n") %>%
+  arrange(desc(n))
+
+eoad_pcp_provider_long
+```
+
+EOAD Primary care location
+
+```{r}
+eoad_pcp_specialty <- df_eoad_cc %>%
+  mutate(
+    primary_care_location = case_when(
+      case_fac == "Case"    ~ prov_spec_closest_visit,
+      case_fac == "Control" ~ cont_provider_spec,
+      TRUE ~ NA_character_
+    ),
+    primary_care_location = str_squish(as.character(primary_care_location))
+  ) %>%
+  filter(!is.na(primary_care_location), primary_care_location != "") %>%
+  count(primary_care_location, case_fac, name = "n") %>%
+  group_by(case_fac) %>%
+  mutate(pct_within_group = n / sum(n)) %>%
+  ungroup() %>%
+  arrange(desc(n))
+
+eoad_pcp_specialty
+```
+
+EOAD Diagnosis departments
+
+```{r}
+eoad_dx_dept_caseonly <- df_eoad_cc %>%
+  filter(case_fac == "Case") %>%
+  mutate(
+    dx_provider_dept = str_squish(as.character(dx_provider_dept))
+  ) %>%
+  filter(!is.na(dx_provider_dept), dx_provider_dept != "") %>%
+  count(dx_provider_dept, name = "n") %>%
+  arrange(desc(n))
+
+eoad_dx_dept_caseonly
+```

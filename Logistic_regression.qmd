@@ -1,0 +1,277 @@
+---
+title: "Logistic_regression"
+format: html
+---
+
+```{r}
+library(tidyverse)
+library(tidyr)
+library(purrr)
+library(broom)
+library(dplyr)
+library(ggplot2)
+library(gtsummary)
+library(scales)
+library(survival)
+
+df_disease_cc <- readRDS("data/df_disease_cc.rds")
+```
+
+## Data preparation
+
+To ensure statistical validity, we restricted our primary regression analysis to the comparison between Black and White participants, as sample sizes for other racial groups were insufficient for conditional logistic models. Controls inherited the disease classification of their matched case to maintain the integrity of the 1-to-1 matching.
+
+```{r}
+df_model <- df_disease_cc %>%
+  mutate(
+    pair_id = as.factor(pair_id),
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    case_indicator = if_else(case_fac == "Case", 1L, 0L),
+
+    gender = factor(gender),
+    gender = fct_relevel(gender, "Male"),
+
+    # collapse race into White / Black / Other
+    race_3group = case_when(
+      race_grouped == "White" ~ "White",
+      race_grouped == "Black or African American" ~ "Black",
+      TRUE ~ "Other"
+    ),
+    race_3group = factor(race_3group, levels = c("White", "Black", "Other")),
+
+    # disease order
+    disease_group_case = factor(
+      disease_group_case,
+      levels = c("LOAD", "EOAD", "FTD", "DLB", "PD", "MND")
+    )
+  ) %>%
+  filter(
+    !is.na(pair_id),
+    !is.na(case_fac),
+    !is.na(age),
+    !is.na(gender),
+    !is.na(race_3group),
+    !is.na(disease_group_case)
+  )
+```
+
+## Sample sizes by disease and race
+
+```{r}
+model_n <- df_model %>%
+  count(disease_group_case, case_fac) %>%
+  tidyr::pivot_wider(names_from = case_fac, values_from = n) %>%
+  mutate(total_n = Control + Case)
+
+knitr::kable(model_n, caption = "Sample size by disease group")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 7
+
+plot_slope_race3 <- df_disease_cc %>%
+  mutate(
+    race_3group = case_when(
+      race_grouped == "White" ~ "White",
+      race_grouped == "Black or African American" ~ "Black",
+      TRUE ~ "Other"
+    ),
+    race_3group = factor(race_3group, levels = c("White", "Black", "Other")),
+    case_fac = factor(case_fac, levels = c("Control", "Case"))
+  ) %>%
+  filter(!is.na(disease_group_case), !is.na(case_fac), !is.na(race_3group)) %>%
+  count(disease_group_case, case_fac, race_3group, name = "n") %>%
+  group_by(disease_group_case, case_fac) %>%
+  mutate(
+    total_group = sum(n),
+    pct = n / total_group,
+    se = sqrt(pct * (1 - pct) / total_group),
+    ci_low = pmax(0, pct - 1.96 * se),
+    ci_high = pmin(1, pct + 1.96 * se)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    x_num = if_else(case_fac == "Control", 1, 2),
+
+    # put labels slightly left/right of the points
+    label_x = if_else(case_fac == "Control", 0.96, 2.04),
+
+    # horizontal alignment
+    label_hjust = if_else(case_fac == "Control", 1, 0),
+
+    # base vertical adjustment by race
+    base_nudge = case_when(
+      race_3group == "White" ~ 0.018,
+      race_3group == "Black" ~ -0.018,
+      race_3group == "Other" ~ 0.012,
+      TRUE ~ 0
+    ),
+
+    # extra adjustment for panels where lines are close
+    extra_nudge = case_when(
+      disease_group_case == "EOAD" & race_3group == "White" ~ 0.020,
+      disease_group_case == "EOAD" & race_3group == "Black" ~ -0.030,
+      disease_group_case == "EOAD" & race_3group == "Other" ~ 0.020,
+
+      disease_group_case == "MND" & race_3group == "Black" ~ -0.030,
+      disease_group_case == "MND" & race_3group == "Other" ~ 0.022,
+
+      TRUE ~ 0
+    ),
+
+    label_y = pct + base_nudge + extra_nudge,
+    label_y = pmin(pmax(label_y, 0.02), 0.88)
+  )
+
+ggplot(
+  plot_slope_race3,
+  aes(x = x_num, y = pct, group = race_3group, color = race_3group, fill = race_3group)
+) +
+  geom_ribbon(aes(ymin = ci_low, ymax = ci_high), alpha = 0.18, color = NA) +
+  geom_line(linewidth = 1.3) +
+  geom_point(size = 2.8) +
+  geom_text(
+    aes(
+      x = label_x,
+      y = label_y,
+      label = percent(pct, accuracy = 0.1),
+      hjust = label_hjust
+    ),
+    size = 3.1,
+    show.legend = FALSE
+  ) +
+  facet_wrap(~ disease_group_case, ncol = 3) +
+  scale_x_continuous(
+    breaks = c(1, 2),
+    labels = c("Control", "Case"),
+    limits = c(0.75, 2.25)
+  ) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 0.9)
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_bw(base_size = 12) +
+  theme(
+    plot.margin = margin(10, 40, 10, 40),
+    axis.title.x = element_blank(),
+    legend.position = "bottom",
+    strip.text = element_text(size = 11),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10)
+  ) +
+  labs(
+    title = "Race Composition by Disease Group (White, Black, Other)",
+    y = "Percent within disease group",
+    color = "Race group",
+    fill = "Race group"
+  )
+```
+
+The slope graph illustrate the change in racial proportions between the matched control group and the case group. A downward slope for the Black or African American line indicates that this group is underrepresented among diagnosed cases compared to their matched controls within the same primary care practice. This visual disparity is most pronounced in **Parkinson’s Disease (PD)** and **Motor Neuron Disease (MND)**, aligning with our regression findings.
+
+While models for **EOAD** and **FTD** suggest a trend toward lower odds of diagnosis for Black participants, these results did not reach statistical significance. The wide confidence intervals and visual overlap in the slope plot ribbons reflect the limited sample size in these categories (N=176 for EOAD and N=86 for FTD). These findings were flagged during preliminary analysis as potentially unstable and should be interpreted with caution.
+
+```{r}
+# Table 2. Baseline demographics by disease group (cases) + controls
+df_table2 <- df_disease_cc %>%
+  mutate(
+    disease_group_cc = if_else(
+      case_fac == "Control",
+      "Control",
+      as.character(disease_group_case)
+    ),
+    race_3group = case_when(
+      race_grouped == "White" ~ "White",
+      race_grouped == "Black or African American" ~ "Black",
+      TRUE ~ "Other"
+    ),
+    race_3group = factor(race_3group, levels = c("White", "Black", "Other"))
+  ) %>%
+  filter(!is.na(disease_group_cc)) %>%
+  mutate(
+    disease_group_cc = factor(
+      disease_group_cc,
+      levels = c("Control", "LOAD", "EOAD", "FTD", "DLB", "PD", "MND")
+    )
+  )
+
+table2 <- df_table2 %>%
+  select(disease_group_cc, age, gender, race_3group) %>%
+  tbl_summary(
+    by = disease_group_cc,
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    missing = "no",
+    label = list(
+      age ~ "Age at Visit",
+      gender ~ "Gender",
+      race_3group ~ "Race Group"
+    )
+  ) %>%
+  add_overall() %>%
+  add_p(
+    test = list(
+      all_continuous() ~ "kruskal.test",
+      all_categorical() ~ "chisq.test"
+    )
+  ) %>%
+  modify_caption("**Table 2. Baseline Demographic Characteristics by Disease Group (Cases) and Controls**")
+
+table2
+```
+
+## Separate conditional logistic regression for each disease group
+
+Standard logistic regression is inappropriate for matched data as it assumes independence between observations. We employed **conditional logistic regression** using the `clogit` function from the `survival` package. This model accounts for the correlated nature of the matched pairs by including `strata(pair_id)`.
+
+```{r}
+#| label: conditional-logistic-models
+#| message: false
+#| warning: false
+
+# We utilize conditional logistic regression to account for the matched 1-to-1 
+# design. This approach estimates the odds of being a 'Case' based on Race 
+# within each matched pair.
+
+# Define the list of diseases in the preferred order for analysis
+disease_list <- c("LOAD", "EOAD", "FTD", "DLB", "PD", "MND")
+
+# Use nested dataframes to run models for all groups simultaneously
+model_results <- df_model %>%
+  mutate(disease_group_case = factor(disease_group_case, levels = disease_list)) %>%
+  group_by(disease_group_case) %>%
+  nest() %>%
+  mutate(
+    # Fit conditional logistic regression for each nested dataset
+    fit = map(data, ~clogit(case_indicator ~ race_3group + strata(pair_id), data = .x)),
+    # Extract tidy coefficients (OR and CI)
+    tidied = map(fit, ~broom::tidy(.x, exponentiate = TRUE, conf.int = TRUE))
+  ) %>%
+  unnest(tidied) %>%
+  # Focus on Black vs White comparison for disparity analysis
+  filter(term == "race_3groupBlack") %>%
+  select(disease_group_case, estimate, conf.low, conf.high, p.value)
+```
+
+```{r}
+#| label: tbl-regression-summary
+#| tbl-cap: "Summary of Conditional Logistic Regression Results (Black vs. White)"
+
+# This table summarizes the Odds Ratios (OR) for Black participants relative 
+# to White participants across all six neurodegenerative disease groups.
+
+model_results %>%
+  transmute(
+    `Disease Group` = disease_group_case,
+    `Odds Ratio` = round(estimate, 3),
+    `95% CI` = sprintf("(%.3f, %.3f)", conf.low, conf.high),
+    `p-value` = scales::pvalue(p.value, accuracy = 0.001)
+  ) %>%
+  knitr::kable()
+```
+
+A significant racial disparity was identified in **Parkinson’s Disease (PD)** and **Motor Neuron Disease (MND)**. In both cases, Black participants showed significantly lower odds of diagnosis compared to White participants, even after matching for primary care provider access. This suggests disease-specific disparities that warrant further clinical investigation into referral patterns.

@@ -1,0 +1,231 @@
+---
+title: "NDD Racial Disparity Dashboard"
+author: "Jiayi Liu"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    source_code: "https://github.com/Jiayi-Liu7/NDD_Racial_Disparity"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(janitor)
+library(stringr)
+library(scales)
+library(dplyr)
+library(ggplot2)
+library(plotly)
+```
+
+# Dashboard {data-icon="fa-signal"}
+
+```{r, include=FALSE}
+# Note: The raw EHC dataset is confidential. Please ensure the dataset is in your working directory.
+datapath <- "Racial Disparity Phase 2 - 03.04.2026.csv"
+
+df <- read_csv(datapath, show_col_types = FALSE) %>%
+  clean_names()
+
+df <- df %>%
+  mutate(
+    exclude = str_squish(as.character(exclude)),
+    exclude = na_if(exclude, "")   # treat blanks as NA
+  )
+
+# Apply manual exclusions (Exclude == "x")
+df <- df %>%
+  filter(is.na(exclude) | tolower(exclude) != "x")
+
+# Create person-level dataset with Case vs Control
+df_case <- df %>%
+  transmute(
+    pair_id, row_id, case_fac = "Case",
+    dx_cd, dx_desc, race = race_desc, gender = gender_desc, age = age_at_visit,
+    dx_provider_nm, dx_provider_dept, prov_name_closest_visit, prov_spec_closest_visit,
+    mons_btw_dx_pcp, emory_assoc_pcp, closest_visit_prov_pcp_flag
+  )
+
+df_control <- df %>%
+  transmute(
+    pair_id, row_id = row_id_cont, case_fac = "Control",
+    dx_cd = NA_character_, dx_desc = NA_character_, race = cont_race_desc,
+    gender = cont_gender_desc, age = cont_age_at_visit,
+    cont_provider_nm, cont_provider_spec,
+    dx_provider_nm, dx_provider_dept, prov_name_closest_visit, prov_spec_closest_visit,
+    mons_btw_dx_pcp, emory_assoc_pcp, closest_visit_prov_pcp_flag
+  )
+
+df_long <- bind_rows(df_case, df_control) %>%
+  mutate(
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    case_indicator = if_else(case_fac == "Case", 1L, 0L)
+  )
+
+# Variables recoding
+df_long <- df_long %>%
+  mutate(
+    race = str_squish(as.character(race)),
+    race_grouped = case_when(
+      race %in% c("Chinese", "Other Asian", "Asian Indian", "Korean", "Vietnamese", "Other Pacific Islander", "Native Hawaiian") ~ "Asian",
+      race %in% c("American Indian or Alaska Native", "American Indian or Alaskan Native", "Multiple", "Other") ~ "Other/Small Group",
+      race %in% c("Decline to Answer", "Unknown", "Not Recorded") | is.na(race) | race == "" ~ "Unknown/Not Reported",
+      race %in% c("White", "Caucasian or White") ~ "White",
+      TRUE ~ race
+    ),
+    race_grouped = factor(race_grouped, levels = c("White", "Black or African American", "Asian", "Other/Small Group", "Unknown/Not Reported"))
+  )
+
+# Disease group mapping
+df_long <- df_long %>%
+  mutate(
+    dx_desc_clean = if_else(is.na(dx_desc), NA_character_, str_squish(as.character(dx_desc))),
+    dx_cd_raw = if_else(is.na(dx_cd), NA_character_, str_to_upper(str_squish(as.character(dx_cd)))),
+    dx_cd_raw = if_else(is.na(dx_cd_raw), NA_character_, str_replace_all(dx_cd_raw, "\\s+", "")),
+    dx_cd_raw = if_else(is.na(dx_cd_raw), NA_character_, str_replace_all(dx_cd_raw, "[^A-Z0-9.]", "")),
+    
+    dx_cd_std = case_when(
+      is.na(dx_cd_raw) ~ NA_character_,
+      str_starts(dx_cd_raw, "G") ~ dx_cd_raw,
+      TRUE ~ str_replace(dx_cd_raw, "(\\.[0-9]*?)0+$", "\\1") %>% str_replace("\\.$", "")
+    ),
+    
+    disease_group = case_when(
+      case_fac != "Case" ~ NA_character_,
+      dx_cd_std == "G30.0" ~ "EOAD",
+      dx_cd_std == "G30.1" ~ "LOAD",
+      dx_cd_std %in% c("G30.9", "331", "G30.8") & age >= 65 ~ "LOAD",
+      dx_cd_std %in% c("G30.9", "331", "G30.8") & age < 65 ~ "EOAD",
+      dx_cd_std %in% c("G20", "332") ~ "PD",
+      dx_cd_std %in% c("G31.83", "331.82") ~ "DLB",
+      dx_cd_std %in% c("335.2", "G12.21", "G12.22", "G12.20", "G12.29", "335.24") ~ "MND",
+      dx_cd_std %in% c("G31.09", "331.19", "G31.01") ~ "FTD",
+      TRUE ~ NA_character_
+    ),
+    disease_group = factor(disease_group, levels = c("LOAD", "EOAD", "FTD", "DLB", "PD", "MND"))
+  )
+
+# Match Control to Case Disease
+case_disease <- df_long %>%
+  filter(case_fac == "Case", !is.na(disease_group)) %>%
+  distinct(pair_id, disease_group)
+
+df_disease_cc <- df_long %>%
+  left_join(case_disease, by = "pair_id", suffix = c("", "_case"), relationship = "many-to-many") %>%
+  mutate(
+    disease_group_case = factor(disease_group_case, levels = levels(df_long$disease_group)),
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    race_grouped = fct_drop(race_grouped)
+  ) %>%
+  filter(!is.na(disease_group_case))
+```
+
+
+Column {data-width=400}
+-----------------------------------------------------------------------
+
+### Widget 1: Racial Composition Across Neurodegenerative Diseases
+
+```{r}
+# Prepare data for Widget 1
+vis1_data <- df_long %>%
+  count(case_fac, race_grouped) %>%
+  group_by(case_fac) %>%
+  mutate(
+    prop = n / sum(n),
+    prop_rounded = round(prop * 100, 1),
+    tooltip_text = paste0(
+      "Group: ", case_fac, "\n",
+      "Race: ", race_grouped, "\n",
+      "Count: ", n, " participants\n",
+      "Proportion: ", prop_rounded, "%"
+    )
+  ) %>%
+  ungroup()
+
+# Create ggplot
+p1 <- ggplot(vis1_data, aes(x = case_fac, y = prop, fill = race_grouped, text = tooltip_text)) +
+  geom_col(position = "fill") +
+  theme_bw(base_size = 13) +
+  labs(
+    title = "Race Distribution of Cases vs Controls",
+    x = "Patient Group (Control vs. Case)",
+    y = "Proportion of Participants (%)",
+    fill = "Race Group"
+  ) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_brewer(palette = "Set2")
+
+# Convert to interactive plotly widget
+ggplotly(p1, tooltip = "text") %>%
+  layout(hoverlabel = list(bgcolor = "white"))
+```
+
+
+Column {data-width=600}
+-----------------------------------------------------------------------
+
+### Widget 2: White vs Black Patient Composition by Disease Group
+
+```{r}
+# Prepare data for Widget 2
+plot_slope_white_black <- df_disease_cc %>%
+  filter(
+    !is.na(disease_group_case),
+    race_grouped %in% c("White", "Black or African American")
+  ) %>%
+  count(disease_group_case, case_fac, race_grouped, name = "n") %>%
+  group_by(disease_group_case, case_fac) %>%
+  mutate(
+    pct = n / sum(n),
+    pct_rounded = round(pct * 100, 1),
+    tooltip_text = paste0(
+      "Disease: ", disease_group_case, "\n",
+      "Race: ", race_grouped, "\n",
+      "Group: ", case_fac, "\n",
+      "Count: ", n, "\n",
+      "Proportion: ", pct_rounded, "%"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(
+    case_fac = factor(case_fac, levels = c("Control", "Case")),
+    race_grouped = factor(race_grouped, levels = c("White", "Black or African American"))
+  )
+
+# Create ggplot
+p2 <- ggplot(plot_slope_white_black, aes(x = case_fac, y = pct, group = race_grouped, color = race_grouped, text = tooltip_text)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 3) +
+  facet_wrap(~ disease_group_case, ncol = 3) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme_bw(base_size = 12) +
+  theme(
+    axis.title.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    title = "White vs Black Patient Composition by Disease Group",
+    y = "Percent within Disease Group (%)",
+    color = "Race Group"
+  )
+
+# Convert to interactive plotly widget
+ggplotly(p2, tooltip = "text") %>%
+  layout(legend = list(orientation = "h", x = 0.2, y = -0.15))
+```
+
+### Real-world Impact & Importance
+
+This dashboard visualizes racial disparities in neurodegenerative disease diagnoses using matched case-control data to highlight systemic inequities. By identifying specific conditions where disparities persist, these insights can directly guide targeted clinical interventions and health policy reforms.
+
+
+# Dataset Description {data-icon="fa-info-circle"}
+
+Column {data-width=1000}
+-----------------------------------------------------------------------
+
+### Data Source and Methodology
+
+This project utilizes a confidential clinical public health dataset from the Emory Healthcare system, containing approximately 10,500 patient records spanning from 2015 to 2024. The analysis employs a 1-to-1 matched case-control design to compare demographic representation, specifically racial composition, across various neurodegenerative conditions. Due to patient privacy regulations and HIPAA compliance, the raw individual-level dataset is restricted and not included in the public repository. All visualizations presented in this dashboard are generated from aggregated, de-identified metrics. This ensures data security while accurately reflecting validated clinical registry outcomes.
