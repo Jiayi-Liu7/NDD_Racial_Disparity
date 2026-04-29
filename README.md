@@ -1,7 +1,7 @@
 # NDD Racial Disparity Dashboard
 
 ## Dashboard Link
-[**Click here to view the Interactive Dashboard**](https://github.com/Jiayi-Liu7/NDD_Racial_Disparity/blob/main/Interactive-visualizations.html)  
+[**Click here to view the Interactive Dashboard**](https://Jiayi-Liu7.github.io/NDD_Racial_Disparity/Interactive-visualizations.html)  
 
 ## Project Overview
 This project visualizes racial disparities in neurodegenerative disease diagnoses. It utilizes a matched case-control design to highlight systemic inequities, specifically comparing the representation of Black and White patients across various conditions.
